@@ -1,5 +1,7 @@
-# custom-pool-v3
 
+# <img src="logo.svg" alt="Balancer" height="128px">
+
+# Pools Manager
 Example of external custom pool for Balancer V3. Extend it to create new pool types.
 
 # Requirements
