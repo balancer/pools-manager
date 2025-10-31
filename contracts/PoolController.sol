@@ -2,6 +2,8 @@
 
 pragma solidity ^0.8.24;
 
+import "forge-std/console.sol";
+
 import { IERC20Metadata } from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
@@ -29,22 +31,29 @@ contract PoolController is IPoolController, Ownable2Step {
     uint256 internal constant _MIN_CHANGE_DURATION = 1 days;
     uint256 internal constant _MAX_CHANGE_DURATION = 10 days;
 
+    IManagedPool internal _managedPool;
+
     IVault internal immutable _vault;
     IRouter internal immutable _router;
-    IManagedPool internal immutable _ManagedPool;
     AdaptiveWeightedPoolFactory internal immutable _poolFactory;
 
     constructor(
         address initialOwner,
-        IManagedPool ManagedPool,
         IVault vault,
         IRouter router,
         AdaptiveWeightedPoolFactory poolFactory
     ) Ownable(initialOwner) {
-        _ManagedPool = ManagedPool;
         _vault = vault;
         _router = router;
         _poolFactory = poolFactory;
+    }
+
+    function initialize(IManagedPool managedPool) external onlyOwner {
+        if (address(_managedPool) != address(0)) {
+            revert AlreadyInitialized();
+        }
+
+        _managedPool = managedPool;
     }
 
     function updateWeights(
@@ -52,20 +61,17 @@ contract PoolController is IPoolController, Ownable2Step {
         uint256 startChangingTime,
         uint256 endChangingTime
     ) external onlyOwner {
-        _updateWeights(newWeights, startChangingTime, endChangingTime);
-    }
-
-    function _updateWeights(uint256[] memory newWeights, uint256 startChangingTime, uint256 endChangingTime) internal {
         uint256 duration = endChangingTime - startChangingTime;
+
         if (duration < _MIN_CHANGE_DURATION || duration > _MAX_CHANGE_DURATION) {
             revert InvalidTimeRange();
         }
 
-        _ManagedPool.updateWeights(newWeights, startChangingTime, endChangingTime);
+        _managedPool.updateWeights(newWeights, startChangingTime, endChangingTime);
     }
 
     function removeToken(IERC20 token, uint256 startChangingTime, uint256 endChangingTime) external onlyOwner {
-        IAdaptiveWeightedPool pool = IAdaptiveWeightedPool(_ManagedPool.getBptToken());
+        IAdaptiveWeightedPool pool = IAdaptiveWeightedPool(_managedPool.getBptToken());
         uint256[] memory weights = pool.getNormalizedWeights();
         IERC20[] memory tokens = _vault.getPoolTokens(address(pool));
 
@@ -79,105 +85,175 @@ contract PoolController is IPoolController, Ownable2Step {
 
         weights[uint256(indexToRemove)] = 0;
 
-        // TODO: rounding issues?
+        uint256 sumWeights = 0;
         for (uint256 i = 0; i < weights.length; i++) {
             if (i == uint256(indexToRemove)) {
                 continue;
             }
 
             weights[i] = weights[i].mulDown(factor);
+            sumWeights += weights[i];
         }
 
-        _updateWeights(weights, startChangingTime, endChangingTime);
+        uint256 remainder = FixedPoint.ONE - sumWeights;
+        for (uint256 i = 0; i < weights.length; i++) {
+            if (weights[i] == 0) {
+                continue;
+            }
+
+            weights[i] += remainder;
+            break;
+        }
+
+        _managedPool.updateWeights(weights, startChangingTime, endChangingTime);
     }
 
-    function addToken(IERC20 token, uint256 weight) external onlyOwner {
-        IAdaptiveWeightedPool pool = IAdaptiveWeightedPool(_ManagedPool.getBptToken());
+    function addToken(
+        TokenConfig memory tokenConfig,
+        uint256 weight,
+        uint256 initialVirtualBalance
+    ) external onlyOwner {
+        address pool = _managedPool.getBptToken();
 
         (IERC20[] memory tokens, TokenInfo[] memory tokensInfo, , ) = _vault.getPoolTokenInfo(address(pool));
-        uint256[] memory weights = pool.getNormalizedWeights();
-        //   TokenConfig[] memory newTokensInfo,
-        //    if (newTokensInfo.length > _MAX_TOKENS) {
-        //     revert ExceedsMaxTokens();
-        // }
 
-        uint256 factor = (FixedPoint.ONE - weight).divDown(FixedPoint.ONE);
+        uint256 newTokensLength = tokens.length + 1;
+        if (newTokensLength > _MAX_TOKENS) {
+            revert ExceedsMaxTokens();
+        }
 
-        int256 index = _findTokenIndex(tokens, token);
-        bool tokenExists = index != -1;
-        if (tokenExists) {
-            // TODO: rounding issues?
+        int256 index = _findTokenIndex(tokens, tokenConfig.token);
+
+        if (index != -1) {
+            uint256 factor = (FixedPoint.ONE - weight).divDown(FixedPoint.ONE);
+            uint256[] memory weights = IAdaptiveWeightedPool(pool).getNormalizedWeights();
+
+            uint256 sumWeights = weight;
+            weights[uint256(index)] = weight;
             for (uint256 i = 0; i < weights.length; i++) {
-                weights[i] = weights[i].mulDown(factor);
-            }
-            _updateWeights(weights, block.timestamp, block.timestamp);
-        } else {
-            uint256 newTokensLength = tokens.length + 1;
-            IERC20[] memory newTokens = new IERC20[](newTokensLength);
-            uint256[] memory newWeights = new uint256[](newTokensLength);
-
-            bool inserted;
-            uint256 j;
-            for (uint256 i = 0; i < tokens.length; i++) {
-                if (!inserted && address(token) < address(tokens[i])) {
-                    newTokens[j] = token;
-                    newWeights[j] = weight;
-                    inserted = true;
-                    j++;
+                if (i == uint256(index)) {
+                    continue;
                 }
 
-                newTokens[j] = tokens[i];
-                newWeights[j] = weights[i].mulDown(factor);
-                j++;
+                weights[i] = weights[i].mulDown(factor);
+                sumWeights += weights[i];
             }
 
-            PoolConfig memory poolConfig = _vault.getPoolConfig(pool);
-            address newPool = _poolFactory.create(
-                AdaptiveWeightedPoolFactory.CreationParams({
-                    name: IERC20Metadata(pool).name(),
-                    symbol: IERC20Metadata(pool).symbol(),
-                    tokens: newTokensInfo,
-                    normalizedWeights: newWeights,
-                    virtualBalances: newVirtualBalances,
-                    roleAccounts: _vault.getPoolRoleAccounts(pool),
-                    swapFeePercentage: poolConfig.staticSwapFeePercentage,
-                    poolHooksContract: _vault.getHooksConfig(pool).hooksContract,
-                    enableDonation: poolConfig.liquidityManagement.enableDonation,
-                    disableUnbalancedLiquidity: poolConfig.liquidityManagement.disableUnbalancedLiquidity,
-                    wrappedBpt: address(_ManagedPool),
-                    salt: bytes32(block.timestamp)
-                })
-            );
+            uint256 remainder = FixedPoint.ONE - sumWeights;
+            for (uint256 i = 0; i < weights.length; i++) {
+                if (weights[i] == 0) {
+                    continue;
+                }
 
-            uint256[] memory minAmountsOut = new uint256[](originalTokensInfo.length);
-            uint256 removeBptAmount = _ManagedPool.balanceOf(address(this));
+                weights[i] += remainder;
+                break;
+            }
+
+            _managedPool.updateWeights(weights, block.timestamp, block.timestamp);
+            _managedPool.setVirtualBalances(uint256(index), initialVirtualBalance);
+            return;
+        } else {
+            PoolConfig memory poolConfig = _vault.getPoolConfig(pool);
+            AdaptiveWeightedPoolFactory.CreationParams memory poolParams = AdaptiveWeightedPoolFactory.CreationParams({
+                name: IERC20Metadata(pool).name(),
+                symbol: IERC20Metadata(pool).symbol(),
+                tokens: new TokenConfig[](newTokensLength),
+                normalizedWeights: new uint256[](newTokensLength),
+                virtualBalances: new uint256[](newTokensLength),
+                roleAccounts: _vault.getPoolRoleAccounts(pool),
+                swapFeePercentage: poolConfig.staticSwapFeePercentage,
+                poolHooksContract: _vault.getHooksConfig(pool).hooksContract,
+                enableDonation: poolConfig.liquidityManagement.enableDonation,
+                disableUnbalancedLiquidity: poolConfig.liquidityManagement.disableUnbalancedLiquidity,
+                managedPool: address(_managedPool),
+                salt: bytes32(block.timestamp)
+            });
+
+            IERC20[] memory newTokens = new IERC20[](newTokensLength);
+
+            {
+                uint256 factor = (FixedPoint.ONE - weight).divDown(FixedPoint.ONE);
+                uint256[] memory weights = IAdaptiveWeightedPool(pool).getNormalizedWeights();
+
+                // Stack too deep
+                TokenInfo[] memory _tokensInfo = tokensInfo;
+                TokenConfig memory _tokenConfig = tokenConfig;
+                uint256 _weight = weight;
+                uint256 _initialVirtualBalance = initialVirtualBalance;
+                IERC20[] memory _tokens = tokens;
+
+                // TODO: refactor this part
+                uint256[] memory virtualBalances = IAdaptiveWeightedPool(pool).getVirtualBalances();
+                bool inserted;
+                uint256 j;
+                for (uint256 i = 0; i < _tokens.length + 1; i++) {
+                    if (i == _tokens.length) {
+                        if (!inserted) {
+                            newTokens[j] = _tokenConfig.token;
+                            poolParams.normalizedWeights[j] = _weight;
+                            poolParams.virtualBalances[j] = _initialVirtualBalance;
+                            poolParams.tokens[j] = _tokenConfig;
+                            j++;
+                        }
+                        break;
+                    }
+
+                    console.log("token address:", address(_tokens[i]));
+                    console.log("_tokenConfig.token address:", address(_tokenConfig.token));
+                    if (!inserted && address(_tokenConfig.token) < address(_tokens[i])) {
+                        newTokens[j] = _tokenConfig.token;
+                        poolParams.normalizedWeights[j] = _weight;
+                        poolParams.virtualBalances[j] = _initialVirtualBalance;
+                        poolParams.tokens[j] = _tokenConfig;
+                        inserted = true;
+                        j++;
+
+                        console.log("aaa: ", weights[i]);
+                    }
+
+                    newTokens[j] = _tokens[i];
+                    poolParams.normalizedWeights[j] = weights[i].mulDown(factor);
+                    poolParams.virtualBalances[j] = virtualBalances[i];
+                    poolParams.tokens[j] = TokenConfig({
+                        token: _tokens[i],
+                        tokenType: _tokensInfo[i].tokenType,
+                        rateProvider: _tokensInfo[i].rateProvider,
+                        paysYieldFees: _tokensInfo[i].paysYieldFees
+                    });
+                    j++;
+
+                    console.log(weights[i]);
+                }
+            }
+
+            address newPool = _poolFactory.create(poolParams);
+
+            uint256 removeBptAmount = _managedPool.balanceOf(address(this));
             IERC20(pool).approve(address(_router), removeBptAmount);
             uint256[] memory amountsOut = _router.removeLiquidityProportional(
                 pool,
                 removeBptAmount,
-                minAmountsOut,
+                new uint256[](tokensInfo.length),
                 false,
                 bytes("")
             );
 
-            // Stack too deep
-            IERC20[] memory _newTokens = newTokens;
-            uint256[] memory exactAmountsIn = new uint256[](newTokensInfo.length);
+            uint256[] memory exactAmountsIn = new uint256[](newTokens.length);
 
             // Here we iterate through the list of previous tokens, get the amountsOut, and fill them into exactAmountsIn for the new list.
-            for (uint256 i = 0; i < originalTokensInfo.length; i++) {
-                int256 index = _findTokenIndex(_newTokens, originalTokens[i]);
-
-                if (index == -1) {
+            for (uint256 i = 0; i < tokensInfo.length; i++) {
+                int256 tokenIndex = _findTokenIndex(newTokens, tokens[i]);
+                if (tokenIndex == -1) {
                     continue;
                 }
-                exactAmountsIn[uint256(index)] = amountsOut[i];
-                originalTokens[i].transfer(address(_vault), exactAmountsIn[uint256(index)]);
+
+                exactAmountsIn[uint256(tokenIndex)] = amountsOut[i];
+                tokens[i].transfer(address(_vault), exactAmountsIn[uint256(tokenIndex)]);
             }
 
-            uint256 bptAmountOut = _router.initialize(newPool, _newTokens, exactAmountsIn, 0, false, bytes(""));
+            uint256 bptAmountOut = _router.initialize(newPool, newTokens, exactAmountsIn, 0, false, bytes(""));
 
-            _ManagedPool.migratePool(newPool, removeBptAmount.mulDown(bptAmountOut));
+            _managedPool.migratePool(newPool, removeBptAmount.mulDown(bptAmountOut));
         }
     }
 

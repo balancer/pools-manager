@@ -7,10 +7,11 @@ import { IWeightedPool } from "@balancer-labs/v3-interfaces/contracts/pool-weigh
 
 /// @notice Manageable Weighted pool interface.
 interface IAdaptiveWeightedPool is IWeightedPool {
-    error InvalidWrappedBptLink();
+    error InvalidManagedPool();
     error SenderNotAllowed();
     error InvalidTimeRange();
 
+    function setVirtualBalances(uint256 tokenIndex, uint256 amountScaled18) external;
     function updateWeights(uint256[] memory newWeights, uint256 startChangingTime, uint256 endChangingTime) external;
     function getVirtualBalances() external view returns (uint256[] memory virtualBalances);
     function getChangingWeightsInfo()

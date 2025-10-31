@@ -8,6 +8,7 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { FixedPoint } from "@balancer-labs/v3-solidity-utils/contracts/math/FixedPoint.sol";
 import { IAdaptiveWeightedPool } from "./interfaces/IAdaptiveWeightedPool.sol";
 import { IManagedPool } from "./interfaces/IManagedPool.sol";
+import { PoolController } from "./PoolController.sol";
 
 contract ManagedPool is IManagedPool {
     using FixedPoint for uint256;
@@ -18,14 +19,26 @@ contract ManagedPool is IManagedPool {
     mapping(address => uint256) internal _lastAppliedIndex;
     mapping(uint256 => uint256) internal _coefficients;
 
-    address internal _PoolController;
+    address internal _poolController;
     address internal _bptToken;
 
+    constructor(PoolController poolController) {
+        _poolController = address(poolController);
+    }
+
     modifier onlyPoolController() {
-        if (msg.sender != _PoolController) {
+        if (msg.sender != _poolController) {
             revert SenderNotAllowed();
         }
         _;
+    }
+
+    // TODO: think about this
+    function initialize(address bptToken) external onlyPoolController {
+        if (_bptToken != address(0)) {
+            revert InitializedAlready();
+        }
+        _bptToken = bptToken;
     }
 
     function getBptToken() external view returns (address) {
@@ -49,7 +62,7 @@ contract ManagedPool is IManagedPool {
     }
 
     function balanceOf(address account) external view returns (uint256) {
-        return _computeBptBalance(account);
+        return _computeBalance(account);
     }
 
     function transfer(address to, uint256 amount) external returns (bool) {
@@ -77,7 +90,7 @@ contract ManagedPool is IManagedPool {
     }
 
     function migrateToNewManager(address newManager) external onlyPoolController {
-        _PoolController = newManager;
+        _poolController = newManager;
     }
 
     function migratePool(address newBptToken, uint256 coefficient) external onlyPoolController {
@@ -88,6 +101,10 @@ contract ManagedPool is IManagedPool {
         _lastUpdateIndex = newIndex;
     }
 
+    function setVirtualBalances(uint256 tokenIndex, uint256 amountScaled18) external onlyPoolController {
+        IAdaptiveWeightedPool(_bptToken).setVirtualBalances(tokenIndex, amountScaled18);
+    }
+
     function updateWeights(
         uint256[] memory newWeights,
         uint256 startChangingTime,
@@ -96,7 +113,7 @@ contract ManagedPool is IManagedPool {
         IAdaptiveWeightedPool(_bptToken).updateWeights(newWeights, startChangingTime, endChangingTime);
     }
 
-    function _computeBptBalance(address account) internal view returns (uint256) {
+    function _computeBalance(address account) internal view returns (uint256) {
         uint256 bptBalance = _balances[account];
         uint256 lastAccountAppliedIndex = _lastAppliedIndex[account];
 
@@ -113,7 +130,7 @@ contract ManagedPool is IManagedPool {
     }
 
     function _updateBalance(address account) internal returns (uint256) {
-        uint256 balance = _computeBptBalance(account);
+        uint256 balance = _computeBalance(account);
         _lastAppliedIndex[account] = _lastUpdateIndex;
         _balances[account] = balance;
         return balance;

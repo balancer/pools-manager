@@ -7,6 +7,7 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 interface IManagedPool is IERC20, IERC20Metadata {
     error SenderNotAllowed();
+    error InitializedAlready();
 
     function getBptToken() external view returns (address);
 
@@ -15,4 +16,6 @@ interface IManagedPool is IERC20, IERC20Metadata {
     function migratePool(address newBptToken, uint256 coefficient) external;
 
     function updateWeights(uint256[] memory newWeights, uint256 startChangingTime, uint256 endChangingTime) external;
+
+    function setVirtualBalances(uint256 tokenIndex, uint256 amountScaled18) external;
 }

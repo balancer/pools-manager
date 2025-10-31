@@ -2,6 +2,8 @@
 
 pragma solidity >=0.8.24;
 
+import "forge-std/console.sol";
+
 import { ISwapFeePercentageBounds } from "@balancer-labs/v3-interfaces/contracts/vault/ISwapFeePercentageBounds.sol";
 import {
     IUnbalancedLiquidityInvariantRatioBounds
@@ -30,7 +32,7 @@ contract AdaptiveWeightedPool is IAdaptiveWeightedPool, BalancerPoolToken, PoolI
     struct NewPoolParams {
         string name;
         string symbol;
-        address wrappedBpt;
+        address managedPool;
         uint256[] normalizedWeights;
         uint256[] initialVirtualBalances;
         string version;
@@ -60,13 +62,12 @@ contract AdaptiveWeightedPool is IAdaptiveWeightedPool, BalancerPoolToken, PoolI
     // implementation of the fixed point power function, as these ratios are often exponents.
     uint256 internal constant _MIN_WEIGHT = 1e16; // 1%
 
-    address internal immutable _wrappedBpt;
+    address internal immutable _managedPool;
 
     uint256[] internal _weights;
     uint256[] internal _targetWeights;
     uint256 internal _startChangingTime;
     uint256 internal _endChangingTime;
-    uint256[] internal _initialVirtualBalances; // TODO: optimize storage
     uint256[] internal _virtualBalances;
 
     constructor(
@@ -75,17 +76,17 @@ contract AdaptiveWeightedPool is IAdaptiveWeightedPool, BalancerPoolToken, PoolI
     ) BalancerPoolToken(vault, params.name, params.symbol) PoolInfo(vault) Version(params.version) {
         InputHelpers.ensureInputLengthMatch(params.normalizedWeights.length, params.initialVirtualBalances.length);
 
-        if (params.wrappedBpt == address(0)) {
-            revert InvalidWrappedBptLink();
+        if (params.managedPool == address(0)) {
+            revert InvalidManagedPool();
         } else if (params.normalizedWeights.length > _MAX_TOKENS) {
             revert IVaultErrors.MaxTokens();
         }
 
-        _wrappedBpt = params.wrappedBpt;
+        _managedPool = params.managedPool;
 
         // Ensure each normalized weight is above the minimum.
         uint256 normalizedSum = 0;
-        for (uint8 i = 0; i < params.normalizedWeights.length; ++i) {
+        for (uint256 i = 0; i < params.normalizedWeights.length; ++i) {
             uint256 normalizedWeight = params.normalizedWeights[i];
             if (normalizedWeight < _MIN_WEIGHT) {
                 revert MinWeight();
@@ -96,7 +97,6 @@ contract AdaptiveWeightedPool is IAdaptiveWeightedPool, BalancerPoolToken, PoolI
 
             _targetWeights.push(0); // Initialize target weights to zero
             _virtualBalances.push(params.initialVirtualBalances[i]);
-            _initialVirtualBalances.push(params.initialVirtualBalances[i]);
         }
 
         // Ensure that the normalized weights sum to ONE.
@@ -105,8 +105,8 @@ contract AdaptiveWeightedPool is IAdaptiveWeightedPool, BalancerPoolToken, PoolI
         }
     }
 
-    modifier onlyWrappedBpt() {
-        if (msg.sender != _wrappedBpt) {
+    modifier onlyManagedPool() {
+        if (msg.sender != _managedPool) {
             revert SenderNotAllowed();
         }
         _;
@@ -147,8 +147,6 @@ contract AdaptiveWeightedPool is IAdaptiveWeightedPool, BalancerPoolToken, PoolI
 
     /// @inheritdoc IBasePool
     function onSwap(PoolSwapParams memory request) public virtual returns (uint256) {
-        uint256 initialVirtualBalanceTokenIn = _initialVirtualBalances[request.indexIn];
-
         uint256 virtualBalanceTokenIn = _virtualBalances[request.indexIn];
         uint256 virtualBalanceTokenOut = _virtualBalances[request.indexOut];
 
@@ -178,7 +176,7 @@ contract AdaptiveWeightedPool is IAdaptiveWeightedPool, BalancerPoolToken, PoolI
             );
         }
 
-        if (initialVirtualBalanceTokenIn > 0 && virtualBalanceTokenIn > 0) {
+        if (virtualBalanceTokenIn > 0) {
             if (amountInScaled18 <= virtualBalanceTokenIn) {
                 virtualBalanceTokenIn -= amountInScaled18;
             } else {
@@ -195,15 +193,13 @@ contract AdaptiveWeightedPool is IAdaptiveWeightedPool, BalancerPoolToken, PoolI
         uint256[] memory newWeights,
         uint256 startChangingTime,
         uint256 endChangingTime
-    ) external onlyWrappedBpt {
+    ) external onlyManagedPool {
         InputHelpers.ensureInputLengthMatch(_weights.length, newWeights.length);
 
         uint256 normalizedSum = 0;
-        for (uint8 i = 0; i < newWeights.length; ++i) {
+        for (uint256 i = 0; i < newWeights.length; i++) {
             uint256 normalizedWeight = newWeights[i];
-            if (normalizedWeight < _MIN_WEIGHT) {
-                revert MinWeight();
-            }
+            console.log("new weight", normalizedWeight);
 
             _weights[i] = _computeWeight(i);
             _targetWeights[i] = normalizedWeight;
@@ -224,8 +220,8 @@ contract AdaptiveWeightedPool is IAdaptiveWeightedPool, BalancerPoolToken, PoolI
         _endChangingTime = endChangingTime;
     }
 
-    function bootstrapToken(uint256 tokenIndex, uint256 amountScaled18) external onlyWrappedBpt {
-        _virtualBalances[tokenIndex] += amountScaled18;
+    function setVirtualBalances(uint256 tokenIndex, uint256 amountScaled18) external onlyManagedPool {
+        _virtualBalances[tokenIndex] = amountScaled18;
     }
 
     function getVirtualBalances() external view returns (uint256[] memory virtualBalances) {
@@ -263,9 +259,16 @@ contract AdaptiveWeightedPool is IAdaptiveWeightedPool, BalancerPoolToken, PoolI
     }
 
     function _computeWeight(uint256 tokenIndex) private view returns (uint256) {
-        if (block.timestamp < _startChangingTime) {
+        uint256 startChangingTime = _startChangingTime;
+        uint256 endChangingTime = _endChangingTime;
+
+        if (startChangingTime == 0 && endChangingTime == 0) {
             return _weights[tokenIndex];
-        } else if (block.timestamp >= _endChangingTime) {
+        }
+
+        if (block.timestamp < startChangingTime) {
+            return _weights[tokenIndex];
+        } else if (block.timestamp >= endChangingTime) {
             return _targetWeights[tokenIndex];
         }
 
@@ -276,11 +279,12 @@ contract AdaptiveWeightedPool is IAdaptiveWeightedPool, BalancerPoolToken, PoolI
             return currentWeight;
         }
 
-        uint256 timeElapsed = block.timestamp - _startChangingTime;
-        uint256 totalDuration = _endChangingTime - _startChangingTime;
-        uint256 weightDifference = targetWeight - currentWeight;
+        uint256 timeElapsed = block.timestamp - startChangingTime;
+        uint256 totalDuration = endChangingTime - startChangingTime;
+        int256 weightDifference = int256(targetWeight) - int256(currentWeight);
+        int256 differencePerTime = (weightDifference * int256(timeElapsed)) / int256(totalDuration);
 
-        return currentWeight + (weightDifference * timeElapsed) / totalDuration;
+        return uint256(int256(currentWeight) + differencePerTime);
     }
 
     /// @inheritdoc ISwapFeePercentageBounds

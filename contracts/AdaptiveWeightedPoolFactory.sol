@@ -31,7 +31,7 @@ contract AdaptiveWeightedPoolFactory is IPoolVersion, BasePoolFactory, Version {
         address poolHooksContract;
         bool enableDonation;
         bool disableUnbalancedLiquidity;
-        address wrappedBpt;
+        address managedPool;
         bytes32 salt;
     }
 
@@ -66,7 +66,7 @@ contract AdaptiveWeightedPoolFactory is IPoolVersion, BasePoolFactory, Version {
                 AdaptiveWeightedPool.NewPoolParams({
                     name: params.name,
                     symbol: params.symbol,
-                    wrappedBpt: params.wrappedBpt,
+                    managedPool: params.managedPool,
                     initialVirtualBalances: params.virtualBalances,
                     normalizedWeights: params.normalizedWeights,
                     version: _poolVersion
